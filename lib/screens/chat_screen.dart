@@ -1,14 +1,22 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
+import '../app/theme.dart';
+import '../models/message_model.dart';
 import '../services/signaling_service.dart';
 import '../services/webrtc_service.dart';
 import '../services/overlay_service.dart';
+import '../widgets/message_bubble.dart';
 import 'call_screen.dart';
+import 'file_share_screen.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:io';
+import 'dart:typed_data';
 
 class ChatScreen extends StatefulWidget {
   final String roomId;
-  final String userId;
-  const ChatScreen({super.key, required this.roomId, required this.userId});
+  final String myId;
+  const ChatScreen({super.key, required this.roomId, required this.myId});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -17,75 +25,417 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   late SignalingService _signaling;
   late WebRTCService _webrtc;
-  final List<Map<String, String>> _messages = [];
-  final _msgController = TextEditingController();
-  bool _connected = false;
+
+  final List<ChatMessage> _messages = [];
+  final _msgCtrl = TextEditingController();
+  final _scrollCtrl = ScrollController();
+  final List<int> _incomingFileBuffer = [];
+
+  bool _peerConnected = false;
+  bool _dataChannelOpen = false;
+  bool _isFilePickerOpen = false;
+  String _statusText = 'Connecting to server...';
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _requestPermissionsAndInit();
+  }
+
+  Future<void> _requestPermissionsAndInit() async {
+    await [Permission.camera, Permission.microphone].request();
     _initConnection();
   }
 
   Future<void> _initConnection() async {
-    _signaling = SignalingService(
-      roomId: widget.roomId,
-      userId: widget.userId,
-    );
+    _signaling = SignalingService(roomId: widget.roomId, userId: widget.myId);
     _webrtc = WebRTCService(signaling: _signaling);
 
-    // Text messages arrive here
-    _webrtc.onMessage = (RTCDataChannelMessage msg) {
-      if (!msg.isBinary) {
-        setState(() {
-          _messages.add({'from': 'peer', 'text': msg.text});
-        });
+    _webrtc.onTextMessage = (text) {
+      if (text.startsWith('FILE_START:') ||
+          text.startsWith('FILE_END:') ||
+          text.isEmpty) {
+        return;
+      }
+      _addMessage(text, isMe: false);
+    };
+
+    _webrtc.onFileStart = (header) {
+      final parts = header.replaceFirst('FILE_START:', '').split(':');
+      _incomingFileBuffer.clear();
+      _addSystemMessage('📎 Receiving file: ${parts[0]}...');
+    };
+
+    _webrtc.onFileChunk = (chunk) {
+      _incomingFileBuffer.addAll(chunk);
+    };
+
+    _webrtc.onFileEnd = (fileName) async {
+      try {
+        final dir = await getExternalStorageDirectory();
+        if (dir == null) {
+          _incomingFileBuffer.clear();
+          _addSystemMessage('✅ File received: $fileName');
+          return;
+        }
+        final filePath = '${dir.path}/$fileName';
+        final bytes = Uint8List.fromList(_incomingFileBuffer);
+        await File(filePath).writeAsBytes(bytes);
+        _incomingFileBuffer.clear();
+
+        final ext = fileName.split('.').last.toLowerCase();
+        const imageExts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'};
+        if (imageExts.contains(ext) && mounted) {
+          setState(() => _messages.add(ChatMessage(
+                id: const Uuid().v4(),
+                text: fileName,
+                isMe: false,
+                timestamp: DateTime.now(),
+                type: ChatMessageType.image,
+                imagePath: filePath,
+              )));
+          _scrollToBottom();
+        } else {
+          _addSystemMessage('✅ File received: $fileName');
+        }
+      } catch (e) {
+        _incomingFileBuffer.clear();
+        _addSystemMessage('✅ File received: $fileName');
       }
     };
 
+    _webrtc.onConnectionStateChange = (state) {
+      final s = state.toString();
+      if (s.contains('Connected') && !s.contains('Dis')) {
+        setState(() {
+          _dataChannelOpen = true;
+          _statusText = 'Peer connected 🟢';
+        });
+        _addSystemMessage('🔒 Secure P2P connection established');
+      } else if (s.contains('Failed') || s.contains('Closed')) {
+        // ✅ Only 'Failed'/'Closed' are terminal — 'Disconnected' is transient
+        setState(() {
+          _dataChannelOpen = false;
+          _peerConnected = false;
+          _statusText = 'Peer disconnected';
+        });
+        _addSystemMessage('⚠️ Peer disconnected.');
+      }
+      // ✅ 'Disconnected' state: do nothing — WebRTC will auto-retry ICE
+    };
+
     _signaling.onPeerJoined = () async {
+      if (!mounted) return;
       setState(() {
-        _connected = true;
+        _peerConnected = true;
+        _statusText = 'Peer joined — connecting...';
       });
-      await _webrtc.createOffer();
+      try {
+        await _webrtc.createOffer();
+        // ✅ After offer is sent, data channel is created on offerer side
+        // onConnectionStateChange from _setupDataChannelListeners will fire when it opens
+      } catch (e) {
+        debugPrint('❌ createOffer (onPeerJoined) failed: $e');
+        _addSystemMessage('❌ Connection failed. Try rejoining.');
+      }
+    };
+
+    _signaling.onPeerAlready = () async {
+      if (!mounted) return;
+      setState(() {
+        _peerConnected = true;
+        _statusText = 'Peer found — waiting for secure link...';
+      });
+      _addSystemMessage('👤 Peer found. Establishing secure channel...');
     };
 
     _signaling.onPeerLeft = () {
-      setState(() => _connected = false);
-      _showSnack('Peer disconnected. Session wiped.');
+      if (!mounted) return;
+      setState(() {
+        _peerConnected = false;
+        _dataChannelOpen = false;
+        _statusText = 'Peer left the room';
+      });
+      _addSystemMessage('👻 Peer has left. Messages clearing...');
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) setState(() => _messages.clear());
+      });
     };
 
-    await _webrtc.initialize(audio: false, video: false);
+    _signaling.onError = (err) {
+      if (!mounted) return;
+      setState(
+          () => _statusText = '⏳ Server waking up... please wait (up to 30s)');
+      _addSystemMessage('⏳ $err — Render free server may be starting up.');
+    };
+
+    _signaling.onIncomingCall = (isVideo) {
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF1A1A2E),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            const SizedBox(height: 8),
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                color: Colors.green.withValues(alpha: 0.15),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(isVideo ? Icons.videocam : Icons.call,
+                  color: Colors.green, size: 32),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              isVideo ? '📹 Incoming Video Call' : '📞 Incoming Audio Call',
+              style: const TextStyle(color: Colors.white, fontSize: 16),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            const Text('Your peer is calling...',
+                style: TextStyle(color: Colors.white54, fontSize: 13)),
+            const SizedBox(height: 24),
+            Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              // ❌ Reject
+              GestureDetector(
+                onTap: () {
+                  _signaling.sendCallReject();
+                  Navigator.pop(ctx);
+                },
+                child: Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.15),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.red),
+                  ),
+                  child:
+                      const Icon(Icons.call_end, color: Colors.red, size: 28),
+                ),
+              ),
+              // ✅ Accept — receiver does NOT send offer (isCaller: false)
+              GestureDetector(
+                onTap: () {
+                  _signaling.sendCallAccept();
+                  Navigator.pop(ctx);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => CallScreen(
+                        isVideo: isVideo,
+                        isCaller: false,
+                        existingWebRTC: _webrtc,
+                        existingSignaling: _signaling,
+                      ),
+                    ),
+                  );
+                },
+                child: Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: Colors.green.withValues(alpha: 0.15),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.green),
+                  ),
+                  child: const Icon(Icons.call, color: Colors.green, size: 28),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 8),
+          ]),
+        ),
+      );
+    };
+
+    try {
+      await _webrtc.initialize(audio: false, video: false);
+    } catch (e) {
+      debugPrint('❌ WebRTC init failed: $e');
+    }
+
+    if (!mounted) return;
+    setState(() => _statusText = 'Waiting for peer to join...');
     _signaling.connect();
   }
 
+  void _addMessage(String text, {required bool isMe}) {
+    setState(() => _messages.add(ChatMessage(
+          id: const Uuid().v4(),
+          text: text,
+          isMe: isMe,
+          timestamp: DateTime.now(),
+          type: ChatMessageType.text,
+        )));
+    _scrollToBottom();
+  }
+
+  void _addSystemMessage(String text) {
+    setState(() => _messages.add(ChatMessage(
+          id: const Uuid().v4(),
+          text: text,
+          isMe: false,
+          timestamp: DateTime.now(),
+          type: ChatMessageType.system,
+        )));
+    _scrollToBottom();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.animateTo(
+          _scrollCtrl.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
   void _sendMessage() {
-    final text = _msgController.text.trim();
-    if (text.isEmpty || !_connected) return;
-    _webrtc.sendMessage(text);
-    setState(() => _messages.add({'from': 'me', 'text': text}));
-    _msgController.clear();
+    final text = _msgCtrl.text.trim();
+    if (text.isEmpty || !_dataChannelOpen) return;
+    _webrtc.sendText(text);
+    _addMessage(text, isMe: true);
+    _msgCtrl.clear();
   }
 
-  void _showSnack(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  // ─── Auto-wipe on minimize ────────────────────────────────────────────────
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+    if (state == AppLifecycleState.detached && !_isFilePickerOpen) {
       _wipeAndClose();
     }
   }
 
   Future<void> _wipeAndClose() async {
-    await _webrtc.dispose();
-    _signaling.dispose();
-    _messages.clear();
+    if (!mounted) return;
+    try {
+      await _webrtc.dispose();
+      _signaling.dispose();
+    } catch (_) {}
+    if (mounted) {
+      setState(() => _messages.clear());
+      Navigator.of(context).popUntil((r) => r.isFirst);
+    }
     await OverlayService.closeGhostChat();
+  }
+
+  // ✅ Caller side: sends ring request, waits for accept before opening CallScreen
+  void _openCall({required bool isVideo}) {
+    _signaling.sendCallRequest(isVideo);
+
+    _signaling.onCallAccepted = () {
+      if (!mounted) return;
+      _signaling.onCallAccepted = null;
+      _signaling.onCallRejected = null;
+      Navigator.of(context, rootNavigator: true).pop();
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CallScreen(
+            isVideo: isVideo,
+            isCaller: true,
+            existingWebRTC: _webrtc,
+            existingSignaling: _signaling,
+          ),
+        ),
+      ).then((_) {
+        // ✅ Re-wire onConnectionStateChange after returning from call
+        if (!mounted) return;
+        _webrtc.onConnectionStateChange = (state) {
+          final s = state.toString();
+          if (s.contains('Connected') && !s.contains('Dis')) {
+            setState(() {
+              _dataChannelOpen = true;
+              _statusText = 'Peer connected 🟢';
+            });
+          } else if (s.contains('Failed') || s.contains('Closed')) {
+            setState(() {
+              _dataChannelOpen = false;
+              _peerConnected = false;
+              _statusText = 'Peer disconnected';
+            });
+          }
+        };
+      });
+    };
+
+    _signaling.onCallRejected = () {
+      if (!mounted) return;
+      _signaling.onCallAccepted = null;
+      _signaling.onCallRejected = null;
+      Navigator.of(context, rootNavigator: true).pop();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('📵 Call was declined'),
+        backgroundColor: Colors.redAccent,
+        duration: Duration(seconds: 3),
+      ));
+    };
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SizedBox(height: 8),
+          Text(
+            isVideo ? '📹 Video Calling...' : '📞 Audio Calling...',
+            style: const TextStyle(color: Colors.white, fontSize: 16),
+          ),
+          const SizedBox(height: 16),
+          const CircularProgressIndicator(color: Colors.deepPurple),
+          const SizedBox(height: 20),
+          TextButton.icon(
+            onPressed: () {
+              _signaling.sendCallEnd();
+              _signaling.onCallAccepted = null;
+              _signaling.onCallRejected = null;
+              Navigator.pop(ctx);
+            },
+            icon: const Icon(Icons.call_end, color: Colors.red),
+            label: const Text('Cancel', style: TextStyle(color: Colors.red)),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  void _openFileShare() {
+    setState(() => _isFilePickerOpen = true);
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => FileShareScreen(webrtc: _webrtc)),
+    ).then((_) {
+      if (mounted) setState(() => _isFilePickerOpen = false);
+    });
+  }
+
+  void _openScreenShare() async {
+    setState(() => _isFilePickerOpen = true); // ✅ block lifecycle wipe
+    try {
+      await _webrtc.addScreenShare();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('🖥️ Screen sharing started'),
+          backgroundColor: Colors.deepPurple,
+          duration: Duration(seconds: 2),
+        ));
+      }
+    } catch (e) {
+      debugPrint('❌ Screen share from chat failed: $e');
+    } finally {
+      if (mounted) setState(() => _isFilePickerOpen = false);
+    }
   }
 
   @override
@@ -93,117 +443,170 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _webrtc.dispose();
     _signaling.dispose();
-    _msgController.dispose();
+    _msgCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0D0D0D),
+      backgroundColor: GhostTheme.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1A1A1A),
+        backgroundColor: GhostTheme.surface,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: GhostTheme.textSecondary),
+          onPressed: _wipeAndClose,
+        ),
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Room: ${widget.roomId}',
-                style: const TextStyle(color: Colors.white, fontSize: 14)),
             Text(
-              _connected ? '🟢 Peer Connected' : '🔴 Waiting for peer...',
-              style: const TextStyle(color: Colors.green, fontSize: 11),
+              'Room: ${widget.roomId}',
+              style: const TextStyle(
+                color: GhostTheme.textPrimary,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                fontFamily: 'monospace',
+              ),
+            ),
+            Text(
+              _statusText,
+              style: TextStyle(
+                color: _peerConnected
+                    ? GhostTheme.green
+                    : GhostTheme.textSecondary,
+                fontSize: 11,
+              ),
             ),
           ],
         ),
         actions: [
-          // ─── Start audio call ─────────────────────────────────────────
           IconButton(
-            icon: const Icon(Icons.call, color: Colors.green),
-            onPressed: _connected
-                ? () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => CallScreen(
-                        roomId: widget.roomId,
-                        userId: widget.userId,
-                        isVideo: false,
-                      ),
-                    ))
-                : null,
+            icon:
+                const Icon(Icons.attach_file, color: GhostTheme.textSecondary),
+            onPressed: _dataChannelOpen ? _openFileShare : null,
+            tooltip: 'Share file',
           ),
-          // ─── Start video call ─────────────────────────────────────────
+          IconButton(
+            icon: const Icon(Icons.screen_share, color: GhostTheme.accent),
+            onPressed: _peerConnected ? _openScreenShare : null,
+            tooltip: 'Share screen',
+          ),
+          IconButton(
+            icon: const Icon(Icons.call, color: GhostTheme.green),
+            onPressed: _peerConnected ? () => _openCall(isVideo: false) : null,
+            tooltip: 'Audio call',
+          ),
           IconButton(
             icon: const Icon(Icons.videocam, color: Colors.blue),
-            onPressed: _connected
-                ? () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => CallScreen(
-                        roomId: widget.roomId,
-                        userId: widget.userId,
-                        isVideo: true,
-                      ),
-                    ))
-                : null,
+            onPressed: _peerConnected ? () => _openCall(isVideo: true) : null,
+            tooltip: 'Video call',
           ),
           IconButton(
-            icon: const Icon(Icons.close, color: Colors.red),
+            icon: const Icon(Icons.close, color: GhostTheme.red),
             onPressed: _wipeAndClose,
           ),
         ],
       ),
       body: Column(
         children: [
-          // ─── Messages list ────────────────────────────────────────────
-          Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: _messages.length,
-              itemBuilder: (_, i) {
-                final msg = _messages[i];
-                final isMe = msg['from'] == 'me';
-                return Align(
-                  alignment:
-                      isMe ? Alignment.centerRight : Alignment.centerLeft,
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(vertical: 4),
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: isMe ? Colors.deepPurple : const Color(0xFF2A2A2A),
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: Text(
-                      msg['text']!,
-                      style: const TextStyle(color: Colors.white),
+          if (!_peerConnected)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              color: GhostTheme.card,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: GhostTheme.accent,
                     ),
                   ),
-                );
-              },
+                  const SizedBox(width: 10),
+                  Text(
+                    _statusText,
+                    style: const TextStyle(
+                        color: GhostTheme.textSecondary, fontSize: 12),
+                  ),
+                ],
+              ),
             ),
+          Expanded(
+            child: _messages.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Text('👻', style: TextStyle(fontSize: 48)),
+                        const SizedBox(height: 12),
+                        Text(
+                          _peerConnected
+                              ? 'Connected! Send a message.'
+                              : 'Share the room code with your peer.',
+                          style: const TextStyle(
+                            color: GhostTheme.textHint,
+                            fontSize: 14,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    controller: _scrollCtrl,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    itemCount: _messages.length,
+                    itemBuilder: (_, i) => MessageBubble(message: _messages[i]),
+                  ),
           ),
-          // ─── Input bar ────────────────────────────────────────────────
           Container(
-            color: const Color(0xFF1A1A1A),
+            decoration: const BoxDecoration(
+              color: GhostTheme.surface,
+              border: Border(top: BorderSide(color: GhostTheme.border)),
+            ),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(
               children: [
                 Expanded(
                   child: TextField(
-                    controller: _msgController,
-                    style: const TextStyle(color: Colors.white),
+                    controller: _msgCtrl,
+                    enabled: _dataChannelOpen,
+                    style: const TextStyle(
+                        color: GhostTheme.textPrimary, fontSize: 15),
+                    maxLines: null,
                     decoration: InputDecoration(
-                      hintText: _connected
+                      hintText: _dataChannelOpen
                           ? 'Type a message...'
                           : 'Waiting for peer...',
-                      hintStyle: const TextStyle(color: Colors.white30),
+                      hintStyle: const TextStyle(color: GhostTheme.textHint),
                       border: InputBorder.none,
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 4, vertical: 8),
                     ),
                     onSubmitted: (_) => _sendMessage(),
                   ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.send, color: Colors.deepPurple),
-                  onPressed: _sendMessage,
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: _sendMessage,
+                  child: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: _dataChannelOpen
+                          ? GhostTheme.accent
+                          : GhostTheme.border,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child:
+                        const Icon(Icons.send, color: Colors.white, size: 18),
+                  ),
                 ),
               ],
             ),

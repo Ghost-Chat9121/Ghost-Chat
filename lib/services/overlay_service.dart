@@ -1,67 +1,51 @@
-import 'package:flutter_overlay_window/flutter_overlay_window.dart';
-
-class OverlayService {
-  static Future<void> requestPermission() async {
-    if (!await FlutterOverlayWindow.isPermissionGranted()) {
-      await FlutterOverlayWindow.requestPermission();
-    }
-  }
-
-  static Future<void> showGhostChat() async {
-    await requestPermission();
-    await FlutterOverlayWindow.showOverlay(
-      enableDrag: false,
-      overlayTitle: "Ghost Chat",
-      overlayContent: '',
-      flag: OverlayFlag.defaultFlag,
-      visibility:
-          NotificationVisibility.visibilitySecret, // hide from notifications
-      positionGravity: PositionGravity.none,
-      width: WindowSize.matchParent,
-      height: WindowSize.matchParent,
-    );
-  }
-
-  static Future<void> closeGhostChat() async {
-    await FlutterOverlayWindow.closeOverlay();
-  }
-
-  static Future<bool> get isActive => FlutterOverlayWindow.isActive();
-}
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 
 class OverlayService {
-  static Future<bool> showGhostChat() async {
-    if (defaultTargetPlatform != TargetPlatform.android) {
-      return false;
-    }
+  static const _channel = MethodChannel('ghost_chat/overlay');
+  static bool _isOverlayContext = false;
 
-    final hasPermission =
-        await FlutterOverlayWindow.isPermissionGranted() ?? false;
-    if (!hasPermission) {
+  // ✅ Call this from overlayMain context to mark we're inside overlay
+  static void markAsOverlayContext() {
+    _isOverlayContext = true;
+  }
+
+  static Future<bool> requestPermission() async {
+    final already = await FlutterOverlayWindow.isPermissionGranted();
+    if (!already) {
       final granted = await FlutterOverlayWindow.requestPermission();
-      if (!granted) {
-        return false;
-      }
+      return granted ?? false;
     }
-
-    await FlutterOverlayWindow.showOverlay(
-      enableDrag: true,
-      overlayTitle: 'Ghost Chat',
-      overlayContent: 'Tap to open',
-      flag: OverlayFlag.defaultFlag,
-      visibility: NotificationVisibility.visibilityPublic,
-      positionGravity: PositionGravity.auto,
-      height: WindowSize.matchParent,
-      width: WindowSize.matchParent,
-      startPosition: const OverlayPosition(0, 0),
-    );
-
     return true;
   }
 
-  static Future<void> closeGhostChat() {
-    return FlutterOverlayWindow.closeOverlay();
+  static Future<void> showGhostChat() async {
+    debugPrint('👻 showGhostChat() called');
+
+    // ✅ If already inside overlay, don't try to launch again
+    if (_isOverlayContext) {
+      debugPrint('⚠️ Already in overlay context — skipping');
+      return;
+    }
+
+    final hasPermission = await requestPermission();
+    debugPrint('🔑 Has permission: $hasPermission');
+    if (!hasPermission) return;
+
+    try {
+      await _channel.invokeMethod('launchOverlay');
+      debugPrint('✅ launchOverlay invoked');
+    } catch (e) {
+      debugPrint('❌ Channel error: $e');
+    }
   }
+
+  static Future<void> closeGhostChat() async {
+    try {
+      await _channel.invokeMethod('closeOverlay');
+    } catch (_) {}
+  }
+
+  static Future<bool> get isActive => FlutterOverlayWindow.isActive();
 }

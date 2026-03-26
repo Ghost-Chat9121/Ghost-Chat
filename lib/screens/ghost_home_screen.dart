@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
+import '../app/theme.dart';
 import '../services/overlay_service.dart';
 import 'chat_screen.dart';
 
@@ -11,162 +13,218 @@ class GhostHomeScreen extends StatefulWidget {
 
 class _GhostHomeScreenState extends State<GhostHomeScreen>
     with WidgetsBindingObserver {
-  final _roomController = TextEditingController();
-  final _userIdController = TextEditingController();
+  final _roomCtrl = TextEditingController();
+  final String _myId = const Uuid().v4().substring(0, 8).toUpperCase();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // Auto-generate a userId
-    _userIdController.text = const Uuid().v4().substring(0, 8);
   }
 
-  // ─── Auto-close overlay when app is minimized ─────────────────────────────
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+    // ✅ ONLY close overlay when app is completely killed from recents
+    // paused = background (WhatsApp behavior — keep alive)
+    // detached = fully killed — wipe everything
+    if (state == AppLifecycleState.detached) {
       OverlayService.closeGhostChat();
     }
   }
 
-  void _joinRoom() {
-    final roomId = _roomController.text.trim();
-    final userId = _userIdController.text.trim();
-    if (roomId.isEmpty) return;
+  void _generateRoom() {
+    _roomCtrl.text = const Uuid().v4().substring(0, 6).toUpperCase();
+  }
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ChatScreen(roomId: roomId, userId: userId),
+  void _copyRoom() {
+    Clipboard.setData(ClipboardData(text: _roomCtrl.text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Room ID copied to clipboard'),
+        duration: Duration(seconds: 1),
+        backgroundColor: GhostTheme.accent,
       ),
     );
   }
 
-  void _createRoom() {
-    _roomController.text = const Uuid().v4().substring(0, 6).toUpperCase();
+  void _joinRoom() {
+    final roomId = _roomCtrl.text.trim().toUpperCase();
+    if (roomId.isEmpty) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(roomId: roomId, myId: _myId),
+      ),
+    );
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _roomController.dispose();
-    _userIdController.dispose();
+    _roomCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0D0D0D),
+      backgroundColor: GhostTheme.bg,
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(20),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ─── Header with close button ────────────────────────────────
+              // ─── Header ─────────────────────────────────────────────
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
-                    '👻 Ghost Chat',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
+                  Row(children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: GhostTheme.accent.withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Text('👻', style: TextStyle(fontSize: 22)),
                     ),
-                  ),
+                    const SizedBox(width: 12),
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Ghost Chat',
+                            style: TextStyle(
+                                color: GhostTheme.textPrimary,
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold)),
+                        Text('Peer-to-peer · No storage · No trace',
+                            style: TextStyle(
+                                color: GhostTheme.green, fontSize: 11)),
+                      ],
+                    ),
+                  ]),
                   IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white54),
+                    icon: const Icon(Icons.close,
+                        color: GhostTheme.textSecondary),
                     onPressed: () => OverlayService.closeGhostChat(),
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
-              const Text(
-                'Peer-to-peer • No storage • No trace',
-                style: TextStyle(color: Colors.green, fontSize: 12),
-              ),
-              const SizedBox(height: 40),
 
-              // ─── Room ID field ────────────────────────────────────────────
-              _buildLabel('Room ID'),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                      child: _buildTextField(
-                          _roomController, 'Enter or generate room ID')),
-                  const SizedBox(width: 10),
-                  ElevatedButton(
-                    onPressed: _createRoom,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green.shade800,
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 16),
-                    ),
-                    child: const Text('New',
-                        style: TextStyle(color: Colors.white)),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 32),
 
-              // ─── User ID field ────────────────────────────────────────────
-              _buildLabel('Your ID (auto-generated)'),
-              const SizedBox(height: 8),
-              _buildTextField(_userIdController, 'User ID'),
-              const SizedBox(height: 40),
-
-              // ─── Join button ──────────────────────────────────────────────
-              SizedBox(
+              // ─── My ID chip ──────────────────────────────────────────
+              Container(
                 width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _joinRoom,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.deepPurple,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: GhostTheme.card,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: GhostTheme.border),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.fingerprint,
+                      color: GhostTheme.textSecondary, size: 18),
+                  const SizedBox(width: 10),
+                  Text('Your ID: $_myId',
+                      style: const TextStyle(
+                          color: GhostTheme.textSecondary,
+                          fontSize: 13,
+                          fontFamily: 'monospace')),
+                ]),
+              ),
+
+              const SizedBox(height: 24),
+
+              // ─── Room ID field ───────────────────────────────────────
+              const Text('Room ID',
+                  style: TextStyle(
+                      color: GhostTheme.textSecondary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500)),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: TextField(
+                    controller: _roomCtrl,
+                    style: const TextStyle(
+                        color: GhostTheme.textPrimary,
+                        fontFamily: 'monospace',
+                        fontSize: 16,
+                        letterSpacing: 2),
+                    textCapitalization: TextCapitalization.characters,
+                    decoration: const InputDecoration(
+                      hintText: 'Enter room code...',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Copy button
+                IconButton(
+                  onPressed: _copyRoom,
+                  icon: const Icon(Icons.copy, color: GhostTheme.textSecondary),
+                  style: IconButton.styleFrom(
+                    backgroundColor: GhostTheme.card,
                     shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: const Text(
-                    'Enter Ghost Room',
-                    style: TextStyle(color: Colors.white, fontSize: 16),
+                ),
+              ]),
+
+              const SizedBox(height: 12),
+
+              // ─── Generate button ─────────────────────────────────────
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _generateRoom,
+                  icon: const Icon(Icons.add,
+                      color: GhostTheme.accentLight, size: 18),
+                  label: const Text('Generate New Room',
+                      style: TextStyle(color: GhostTheme.accentLight)),
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: GhostTheme.accent),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
                   ),
                 ),
               ),
-              const Spacer(),
-              const Center(
-                child: Text(
-                  '🔒 All data is end-to-end, peer-to-peer.\nNothing is ever saved.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white30, fontSize: 11),
+
+              const SizedBox(height: 12),
+
+              // ─── Join button ─────────────────────────────────────────
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _joinRoom,
+                  icon: const Icon(Icons.arrow_forward, size: 18),
+                  label: const Text('Enter Ghost Room'),
                 ),
               ),
+
+              const Spacer(),
+
+              // ─── Footer ──────────────────────────────────────────────
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                        color: GhostTheme.green, shape: BoxShape.circle),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'End-to-end P2P • Session auto-wipes on close',
+                    style: TextStyle(color: GhostTheme.textHint, fontSize: 11),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
             ],
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLabel(String text) =>
-      Text(text, style: const TextStyle(color: Colors.white70, fontSize: 13));
-
-  Widget _buildTextField(TextEditingController ctrl, String hint) {
-    return TextField(
-      controller: ctrl,
-      style: const TextStyle(color: Colors.white),
-      decoration: InputDecoration(
-        hintText: hint,
-        hintStyle: const TextStyle(color: Colors.white30),
-        filled: true,
-        fillColor: const Color(0xFF1A1A1A),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: BorderSide.none,
         ),
       ),
     );

@@ -1,35 +1,35 @@
 import 'package:flutter/material.dart';
 import 'screens/host_app_screen.dart';
-import 'overlay_main.dart';
+import 'screens/ghost_home_screen.dart';
+import 'services/overlay_service.dart';
 
-// ─── Normal app entry point ───────────────────────────────────────────────────
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const GhostChatApp());
+  runApp(const HostApp());
 }
 
-class GhostChatApp extends StatelessWidget {
-  const GhostChatApp({super.key});
+class HostApp extends StatelessWidget {
+  const HostApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Subway Surfers', // disguised app name
+      title: 'Subway Surfers',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.orange),
-        useMaterial3: true,
-      ),
+      theme: ThemeData(brightness: Brightness.dark, useMaterial3: true),
       home: const HostAppScreen(),
     );
   }
 }
 
-// ─── Overlay entry point (Ghost Chat UI) ─────────────────────────────────────
 @pragma("vm:entry-point")
 void overlayMain() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const MaterialApp(
-    debugShowCheckedModeBanner: false,
-    home: OverlayRoot(),
-  ));
+  OverlayService.markAsOverlayContext(); // ✅ marks this as overlay engine
+  runApp(
+    const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: GhostHomeScreen(), // ✅ Ghost Chat UI
+    ),
+  );
 }
