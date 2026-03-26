@@ -227,7 +227,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               // ✅ Accept — receiver does NOT send offer (isCaller: false)
               GestureDetector(
                 onTap: () {
-                  _signaling.sendCallAccept();
+                  // FIX ONE-WAY AUDIO: Do NOT send call-accept here. Let CallScreen 
+                  // send it AFTER media tracks are added to the peer connection.
                   Navigator.pop(ctx);
                   // BUG 11 FIX: re-wire onConnectionStateChange after returning from call (receiver side)
                   Navigator.push(

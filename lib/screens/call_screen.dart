@@ -107,6 +107,11 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
 
+    if (!widget.isCaller) {
+      // FIX ONE-WAY AUDIO: Receiver sends call-accept ONLY AFTER adding media tracks
+      widget.existingSignaling.sendCallAccept();
+    }
+
     setState(() {
       _localRenderer.srcObject = widget.existingWebRTC.localStream;
       if (widget.existingWebRTC.remoteStream != null) {
