@@ -21,13 +21,17 @@ class WebRTCService {
   Function(RTCPeerConnectionState)? onConnectionStateChange;
   Function(String error)? onScreenShareError;
 
+  // BUG 3 FIX: Expose data channel open/close events to the UI
+  Function()? onDataChannelOpen;
+  Function()? onDataChannelClosed;
+
   bool _isDisposed = false;
   bool _remoteDescSet = false;
-  bool _isScreenSharing = false; // ✅ Add this
+  bool _isScreenSharing = false;
   final List<RTCIceCandidate> _pendingCandidates = [];
 
-  // ✅ Audio renderer for remote audio playback
-  final RTCVideoRenderer _audioRenderer = RTCVideoRenderer();
+  // BUG 9 FIX: make _audioRenderer nullable; create fresh on each initialize()
+  RTCVideoRenderer? _audioRenderer;
 
   WebRTCService({required this.signaling});
 
@@ -69,7 +73,10 @@ class WebRTCService {
     bool screenShare = false,
   }) async {
     await _teardown();
-    await _audioRenderer.initialize();
+
+    // BUG 9 FIX: create a fresh renderer each time (old one was disposed in _teardown)
+    _audioRenderer = RTCVideoRenderer();
+    await _audioRenderer!.initialize();
     _isDisposed = false;
 
     if (audio || video || screenShare) {
@@ -109,7 +116,7 @@ class WebRTCService {
         debugPrint(
             '📥 Track kinds: ${event.streams[0].getTracks().map((t) => t.kind).toList()}');
 
-        // ✅ Handle audio track - ensure it's enabled
+        // Ensure audio tracks are enabled
         for (final track in event.streams[0].getTracks()) {
           if (track.kind == 'audio') {
             debugPrint('🔊 Audio track found - ensuring enabled');
@@ -117,8 +124,8 @@ class WebRTCService {
           }
         }
 
-        // ✅ Attach remote stream to audio renderer
-        _audioRenderer.srcObject = remoteStream;
+        // Attach remote stream to audio renderer
+        _audioRenderer?.srcObject = remoteStream;
 
         onRemoteStream?.call(remoteStream!);
 
@@ -260,6 +267,13 @@ class WebRTCService {
   void _setupDataChannelListeners(RTCDataChannel channel) {
     channel.onDataChannelState = (state) {
       debugPrint('📡 DataChannel: $state');
+      // BUG 3 FIX: fire open/close callbacks so UI can accurately track send-readiness
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        onDataChannelOpen?.call();
+      } else if (state == RTCDataChannelState.RTCDataChannelClosed ||
+          state == RTCDataChannelState.RTCDataChannelClosing) {
+        onDataChannelClosed?.call();
+      }
     };
     channel.onMessage = (RTCDataChannelMessage msg) {
       if (!msg.isBinary) {
@@ -310,21 +324,18 @@ class WebRTCService {
     }
   }
 
-  // ✅ FIXED: Screen share with better error handling
-  // Replace your addScreenShare method with this one
   Future<void> addScreenShare() async {
     if (_pc == null) {
       onScreenShareError?.call('Connection not ready');
       return;
     }
 
-    // ✅ Mark as sharing at the start
     _isScreenSharing = true;
 
     try {
       debugPrint('🖥️ Starting screen share...');
 
-      // ✅ Start foreground service FIRST (Android 14+ requirement)
+      // Start foreground service FIRST (Android 14+ requirement)
       try {
         await _foregroundServiceChannel.invokeMethod('startService');
         debugPrint('✅ Foreground service started');
@@ -333,7 +344,6 @@ class WebRTCService {
         // Continue anyway - service might already be running
       }
 
-      // Get display media for screen sharing
       final screenStream = await navigator.mediaDevices
           .getDisplayMedia({'video': true, 'audio': false});
 
@@ -343,13 +353,11 @@ class WebRTCService {
 
       final screenTrack = screenStream.getVideoTracks().first;
 
-      // Handle when user stops sharing from system UI
       screenTrack.onEnded = () {
         debugPrint('🖥️ Screen share ended by user');
         _isScreenSharing = false;
       };
 
-      // Replace video track in peer connection
       final senders = await _pc!.getSenders();
       RTCRtpSender? videoSender;
       for (final s in senders) {
@@ -367,7 +375,6 @@ class WebRTCService {
         debugPrint('🖥️ Added screen track');
       }
 
-      // Stop camera video tracks
       if (localStream != null) {
         for (final track in localStream!.getVideoTracks()) {
           track.stop();
@@ -375,18 +382,18 @@ class WebRTCService {
       }
 
       localStream = screenStream;
-
-      // Renegotiate connection
       await renegotiate();
 
-      // ✅ Mark as sharing on success
       _isScreenSharing = true;
       debugPrint('✅ Screen share started successfully');
     } catch (e) {
       debugPrint('❌ Screen share failed: $e');
-
-      // ✅ Mark as NOT sharing on error
       _isScreenSharing = false;
+
+      // Stop foreground service on failure
+      try {
+        await _foregroundServiceChannel.invokeMethod('stopService');
+      } catch (_) {}
 
       String errorMessage;
       final errorStr = e.toString().toLowerCase();
@@ -410,7 +417,6 @@ class WebRTCService {
     }
   }
 
-  // ✅ FIXED: Stop screen share and restore camera
   Future<void> stopScreenShare({required bool video}) async {
     if (_pc == null) {
       debugPrint('⚠️ stopScreenShare: _pc is null');
@@ -421,7 +427,6 @@ class WebRTCService {
       debugPrint('🖥️ Stopping screen share...');
 
       if (video) {
-        // Get camera stream
         final camStream = await navigator.mediaDevices.getUserMedia({
           'audio': false,
           'video': {'facingMode': 'user', 'width': 1280, 'height': 720},
@@ -429,7 +434,6 @@ class WebRTCService {
 
         final camTrack = camStream.getVideoTracks().first;
 
-        // Replace screen track with camera track
         final senders = await _pc!.getSenders();
         for (final s in senders) {
           if (s.track?.kind == 'video') {
@@ -438,7 +442,6 @@ class WebRTCService {
           }
         }
 
-        // Stop and dispose screen share stream
         if (localStream != null) {
           for (final track in localStream!.getTracks()) {
             track.stop();
@@ -449,7 +452,6 @@ class WebRTCService {
         localStream = camStream;
         debugPrint('✅ Camera restored after screen share');
       } else {
-        // Just stop the screen share without restoring camera
         if (localStream != null) {
           for (final track in localStream!.getTracks()) {
             track.stop();
@@ -459,8 +461,12 @@ class WebRTCService {
         }
       }
 
-      // ✅ Mark as NOT sharing
       _isScreenSharing = false;
+
+      // Stop foreground service
+      try {
+        await _foregroundServiceChannel.invokeMethod('stopService');
+      } catch (_) {}
 
       await renegotiate();
     } catch (e) {
@@ -495,6 +501,21 @@ class WebRTCService {
       await Future.delayed(const Duration(milliseconds: 15));
     }
     _dataChannel!.send(RTCDataChannelMessage('FILE_END:$fileName'));
+  }
+
+  /// Stop call media tracks without destroying the peer connection.
+  /// Call this when ending a voice/video call to release mic and camera.
+  Future<void> stopCallMedia() async {
+    try {
+      if (localStream != null) {
+        localStream!.getTracks().forEach((t) => t.stop());
+        await localStream!.dispose();
+        localStream = null;
+        debugPrint('🎙️ Call media tracks stopped');
+      }
+    } catch (e) {
+      debugPrint('⚠️ stopCallMedia failed: $e');
+    }
   }
 
   void toggleMute() {
@@ -549,7 +570,9 @@ class WebRTCService {
       remoteStream?.getTracks().forEach((t) => t.stop());
       await remoteStream?.dispose();
       await _pc?.close();
-      await _audioRenderer.dispose();
+      // BUG 9 FIX: dispose and null _audioRenderer so initialize() creates a fresh one
+      await _audioRenderer?.dispose();
+      _audioRenderer = null;
     } catch (_) {}
     _pc = null;
     localStream = null;

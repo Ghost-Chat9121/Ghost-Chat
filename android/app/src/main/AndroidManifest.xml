@@ -18,9 +18,7 @@
     <uses-permission android:name="android.permission.VIBRATE"/>
     <uses-permission android:name="android.permission.BLUETOOTH"/>
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
-    <!-- For screen sharing foreground service (Android 14+) -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- BUG 17 FIX: removed duplicate FOREGROUND_SERVICE permissions (already declared above) -->
 
     <application
         android:label="Subway Surfers"

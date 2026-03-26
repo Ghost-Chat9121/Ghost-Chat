@@ -8,6 +8,9 @@ class SignalingService {
   final String roomId;
   final String userId;
 
+  // BUG 8 FIX: track whether socket has been initialized
+  bool _socketInitialized = false;
+
   Function(Map)? onOffer;
   Function(Map)? onAnswer;
   Function(Map)? onIceCandidate;
@@ -24,14 +27,14 @@ class SignalingService {
   SignalingService({required this.roomId, required this.userId});
 
   void connect() {
-    // ✅ If socket already exists and is connected, skip reconnect
-    try {
-      if (socket.connected) {
-        debugPrint('⚡ Already connected, skipping reconnect');
-        return;
-      }
-    } catch (_) {
-      // socket not initialized yet → we'll create it below
+    // BUG 8 FIX: safe guard — avoids LateInitializationError on early dispose
+    if (_socketInitialized) {
+      try {
+        if (socket.connected) {
+          debugPrint('⚡ Already connected, skipping reconnect');
+          return;
+        }
+      } catch (_) {}
     }
 
     socket = io.io(
@@ -46,6 +49,7 @@ class SignalingService {
           .build(),
     );
 
+    _socketInitialized = true;
     socket.connect();
 
     socket.onConnect((_) {
@@ -125,6 +129,8 @@ class SignalingService {
   void sendCallReject() => socket.emit('call-reject', {'roomId': roomId});
 
   void dispose() {
+    // BUG 8 FIX: only touch socket if it was ever initialized
+    if (!_socketInitialized) return;
     try {
       socket.disconnect();
       socket.dispose();

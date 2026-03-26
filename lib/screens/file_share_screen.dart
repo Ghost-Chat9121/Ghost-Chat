@@ -22,7 +22,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
   double _sendProgress = 0;
   String? _sendingFile;
 
-  // ✅ Store received files with bytes for inline preview
   final List<Map<String, dynamic>> _receivedFiles = [];
   FileTransfer? _activeReceive;
 
@@ -70,11 +69,23 @@ class _FileShareScreenState extends State<FileShareScreen> {
       setState(() {});
     };
 
-    widget.webrtc.onFileEnd = (fileName) async {
+    widget.webrtc.onFileEnd = (rawFileName) async {
       if (_activeReceive == null) return;
+
+      // BUG 5 FIX: sanitize filename to prevent path traversal
+      final fileName = _sanitizeFileName(rawFileName);
+
       try {
+        // BUG 5 FIX: null-check getExternalStorageDirectory() (was force-unwrapped with !)
         final dir = await getExternalStorageDirectory();
-        final file = File('${dir!.path}/$fileName');
+        if (dir == null) {
+          debugPrint('❌ External storage not available');
+          if (mounted) {
+            setState(() => _activeReceive = null);
+          }
+          return;
+        }
+        final file = File('${dir.path}/$fileName');
         final bytes = Uint8List.fromList(_activeReceive!.buffer);
         await file.writeAsBytes(bytes);
         if (!mounted) return;
@@ -83,14 +94,21 @@ class _FileShareScreenState extends State<FileShareScreen> {
             'name': fileName,
             'path': file.path,
             'size': bytes.length,
-            'bytes': bytes, // ✅ keep bytes in memory for preview
+            'bytes': bytes,
           });
           _activeReceive = null;
         });
       } catch (e) {
         debugPrint('❌ File save failed: $e');
+        if (mounted) setState(() => _activeReceive = null);
       }
     };
+  }
+
+  /// Strip path traversal characters from a received filename.
+  String _sanitizeFileName(String name) {
+    final base = name.split('/').last.split('\\').last;
+    return base.replaceAll(RegExp(r'[^\w.\-]'), '_');
   }
 
   @override
@@ -112,7 +130,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
     await _sendBytes(file.bytes!, file.name);
   }
 
-  // ✅ Camera: take photo and send directly
   Future<void> _takePhotoAndSend() async {
     final picker = ImagePicker();
     final picked = await picker.pickImage(
@@ -125,7 +142,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
     await _sendBytes(bytes, name);
   }
 
-  // ✅ Camera: record video and send
   Future<void> _takeVideoAndSend() async {
     final picker = ImagePicker();
     final picked = await picker.pickVideo(
@@ -250,7 +266,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
                 ]),
               ),
             ] else ...[
-              // ✅ Three send options
               Row(
                 children: [
                   Expanded(
@@ -339,7 +354,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
                     final bytes = f['bytes'] as Uint8List?;
 
                     if (_isImage(name) && bytes != null) {
-                      // ✅ Image preview card
                       return GestureDetector(
                         onTap: () => _viewFullImage(ctx, bytes, name),
                         child: Container(
@@ -394,7 +408,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
                         ),
                       );
                     } else if (_isVideo(name)) {
-                      // ✅ Video card with tap to open
                       return GestureDetector(
                         onTap: () => _openFile(path),
                         child: Container(
@@ -438,7 +451,6 @@ class _FileShareScreenState extends State<FileShareScreen> {
                         ),
                       );
                     } else {
-                      // ✅ Generic file card
                       return GestureDetector(
                         onTap: () => _openFile(path),
                         child: Container(
@@ -508,7 +520,7 @@ class _FileShareScreenState extends State<FileShareScreen> {
   }
 }
 
-// ✅ Reusable action button
+// Reusable action button
 class _ActionBtn extends StatelessWidget {
   final IconData icon;
   final String label;

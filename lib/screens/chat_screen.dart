@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
 import '../app/theme.dart';
@@ -9,6 +10,7 @@ import '../services/overlay_service.dart';
 import '../widgets/message_bubble.dart';
 import 'call_screen.dart';
 import 'file_share_screen.dart';
+import 'screen_share_screen.dart'; // BUG 6 FIX: import the screen share screen
 import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 import 'dart:typed_data';
@@ -34,6 +36,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _peerConnected = false;
   bool _dataChannelOpen = false;
   bool _isFilePickerOpen = false;
+  // BUG 7 FIX: track whether the "calling..." dialog is currently on screen
+  bool _callingDialogShowing = false;
   String _statusText = 'Connecting to server...';
 
   @override
@@ -71,7 +75,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _incomingFileBuffer.addAll(chunk);
     };
 
-    _webrtc.onFileEnd = (fileName) async {
+    _webrtc.onFileEnd = (rawFileName) async {
+      // BUG 14 FIX: strip any path traversal from the received filename
+      final fileName = _sanitizeFileName(rawFileName);
       try {
         final dir = await getExternalStorageDirectory();
         if (dir == null) {
@@ -105,25 +111,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     };
 
-    _webrtc.onConnectionStateChange = (state) {
-      final s = state.toString();
-      if (s.contains('Connected') && !s.contains('Dis')) {
-        setState(() {
-          _dataChannelOpen = true;
-          _statusText = 'Peer connected 🟢';
-        });
-        _addSystemMessage('🔒 Secure P2P connection established');
-      } else if (s.contains('Failed') || s.contains('Closed')) {
-        // ✅ Only 'Failed'/'Closed' are terminal — 'Disconnected' is transient
-        setState(() {
-          _dataChannelOpen = false;
-          _peerConnected = false;
-          _statusText = 'Peer disconnected';
-        });
-        _addSystemMessage('⚠️ Peer disconnected.');
-      }
-      // ✅ 'Disconnected' state: do nothing — WebRTC will auto-retry ICE
+    // BUG 3 FIX: Use data channel callbacks (not peer connection state) to drive _dataChannelOpen
+    _webrtc.onDataChannelOpen = () {
+      if (!mounted) return;
+      setState(() {
+        _dataChannelOpen = true;
+        _statusText = 'Peer connected 🟢';
+      });
+      _addSystemMessage('🔒 Secure P2P connection established');
     };
+
+    _webrtc.onDataChannelClosed = () {
+      if (!mounted) return;
+      setState(() {
+        _dataChannelOpen = false;
+      });
+    };
+
+    // Keep peer connection state for disconnect detection only
+    _webrtc.onConnectionStateChange = _buildConnectionStateHandler();
 
     _signaling.onPeerJoined = () async {
       if (!mounted) return;
@@ -133,8 +139,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       });
       try {
         await _webrtc.createOffer();
-        // ✅ After offer is sent, data channel is created on offerer side
-        // onConnectionStateChange from _setupDataChannelListeners will fire when it opens
       } catch (e) {
         debugPrint('❌ createOffer (onPeerJoined) failed: $e');
         _addSystemMessage('❌ Connection failed. Try rejoining.');
@@ -225,6 +229,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 onTap: () {
                   _signaling.sendCallAccept();
                   Navigator.pop(ctx);
+                  // BUG 11 FIX: re-wire onConnectionStateChange after returning from call (receiver side)
                   Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -235,7 +240,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         existingSignaling: _signaling,
                       ),
                     ),
-                  );
+                  ).then((_) {
+                    if (!mounted) return;
+                    _webrtc.onConnectionStateChange =
+                        _buildConnectionStateHandler();
+                  });
                 },
                 child: Container(
                   width: 56,
@@ -264,6 +273,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() => _statusText = 'Waiting for peer to join...');
     _signaling.connect();
+  }
+
+  /// BUG 3 + BUG 11 FIX: shared handler factory so both caller and receiver
+  /// can re-wire the same logic after returning from CallScreen.
+  Function(RTCPeerConnectionState) _buildConnectionStateHandler() {
+    return (state) {
+      final s = state.toString();
+      if (s.contains('Failed') || s.contains('Closed')) {
+        if (!mounted) return;
+        setState(() {
+          _dataChannelOpen = false;
+          _peerConnected = false;
+          _statusText = 'Peer disconnected';
+        });
+        _addSystemMessage('⚠️ Peer disconnected.');
+      }
+      // 'Disconnected' is transient — WebRTC auto-retries ICE
+    };
+  }
+
+  /// BUG 14 FIX: strip path separators so a hostile peer can't write outside the download dir
+  String _sanitizeFileName(String name) {
+    // Keep only the final component and replace unsafe chars
+    final base = name.split('/').last.split('\\').last;
+    return base.replaceAll(RegExp(r'[^\w.\-]'), '_');
   }
 
   void _addMessage(String text, {required bool isMe}) {
@@ -328,7 +362,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await OverlayService.closeGhostChat();
   }
 
-  // ✅ Caller side: sends ring request, waits for accept before opening CallScreen
+  // BUG 7 FIX: Caller side — track dialog visibility; guard pop against wrong route
   void _openCall({required bool isVideo}) {
     _signaling.sendCallRequest(isVideo);
 
@@ -336,7 +370,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       _signaling.onCallAccepted = null;
       _signaling.onCallRejected = null;
-      Navigator.of(context, rootNavigator: true).pop();
+      // BUG 7 FIX: only pop if our dialog is still showing
+      if (_callingDialogShowing) {
+        _callingDialogShowing = false;
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+      // BUG 11 FIX: re-wire onConnectionStateChange after returning from call (caller side)
       Navigator.push(
         context,
         MaterialPageRoute(
@@ -348,23 +387,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       ).then((_) {
-        // ✅ Re-wire onConnectionStateChange after returning from call
         if (!mounted) return;
-        _webrtc.onConnectionStateChange = (state) {
-          final s = state.toString();
-          if (s.contains('Connected') && !s.contains('Dis')) {
-            setState(() {
-              _dataChannelOpen = true;
-              _statusText = 'Peer connected 🟢';
-            });
-          } else if (s.contains('Failed') || s.contains('Closed')) {
-            setState(() {
-              _dataChannelOpen = false;
-              _peerConnected = false;
-              _statusText = 'Peer disconnected';
-            });
-          }
-        };
+        _webrtc.onConnectionStateChange = _buildConnectionStateHandler();
       });
     };
 
@@ -372,7 +396,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       _signaling.onCallAccepted = null;
       _signaling.onCallRejected = null;
-      Navigator.of(context, rootNavigator: true).pop();
+      if (_callingDialogShowing) {
+        _callingDialogShowing = false;
+        Navigator.of(context, rootNavigator: true).pop();
+      }
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text('📵 Call was declined'),
         backgroundColor: Colors.redAccent,
@@ -380,6 +407,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ));
     };
 
+    _callingDialogShowing = true;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -400,6 +428,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               _signaling.sendCallEnd();
               _signaling.onCallAccepted = null;
               _signaling.onCallRejected = null;
+              _callingDialogShowing = false;
               Navigator.pop(ctx);
             },
             icon: const Icon(Icons.call_end, color: Colors.red),
@@ -407,7 +436,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ]),
       ),
-    );
+    ).then((_) {
+      // Dialog dismissed (any path)
+      _callingDialogShowing = false;
+    });
   }
 
   void _openFileShare() {
@@ -420,22 +452,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
-  void _openScreenShare() async {
-    setState(() => _isFilePickerOpen = true); // ✅ block lifecycle wipe
-    try {
-      await _webrtc.addScreenShare();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('🖥️ Screen sharing started'),
-          backgroundColor: Colors.deepPurple,
-          duration: Duration(seconds: 2),
-        ));
-      }
-    } catch (e) {
-      debugPrint('❌ Screen share from chat failed: $e');
-    } finally {
-      if (mounted) setState(() => _isFilePickerOpen = false);
-    }
+  // BUG 6 FIX: Navigate to ScreenShareScreen (dedicated UI) instead of calling addScreenShare() directly
+  void _openScreenShare() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            ScreenShareScreen(roomId: widget.roomId, myId: widget.myId),
+      ),
+    );
   }
 
   @override

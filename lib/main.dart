@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'app/theme.dart'; // BUG 12 FIX
 import 'screens/host_app_screen.dart';
 import 'screens/ghost_home_screen.dart';
 import 'services/overlay_service.dart';
@@ -26,10 +27,12 @@ class HostApp extends StatelessWidget {
 void overlayMain() {
   WidgetsFlutterBinding.ensureInitialized();
   OverlayService.markAsOverlayContext(); // ✅ marks this as overlay engine
+  // BUG 12 FIX: Apply GhostTheme.dark so custom input/button/appbar styles take effect
   runApp(
-    const MaterialApp(
+    MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: GhostHomeScreen(), // ✅ Ghost Chat UI
+      theme: GhostTheme.dark,
+      home: const GhostHomeScreen(),
     ),
   );
 }

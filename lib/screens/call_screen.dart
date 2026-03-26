@@ -36,6 +36,8 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
   bool _speakerOn = true;
   bool _ended = false;
   bool _screenSharing = false;
+  // BUG 16 FIX: track whether renderers have been disposed
+  bool _renderersDisposed = false;
   String _status = 'Starting call...';
 
   Timer? _timer;
@@ -54,7 +56,7 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
     await _localRenderer.initialize();
     await _remoteRenderer.initialize();
 
-    // ✅ Wire remote stream BEFORE adding media
+    // Wire remote stream BEFORE adding media
     widget.existingWebRTC.onRemoteStream = (stream) {
       if (!mounted) return;
       setState(() {
@@ -64,11 +66,11 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
       });
       _startTimer();
 
-      // ✅ CRITICAL: Enable speaker when remote stream arrives
+      // Enable speaker when remote stream arrives
       widget.existingWebRTC.setSpeakerOn(true);
     };
 
-    // ✅ Only react to Failed/Closed
+    // Only react to Failed/Closed — not transient Disconnected
     widget.existingWebRTC.onConnectionStateChange = (state) {
       final s = state.toString();
       if (s.contains('Failed') || s.contains('Closed')) {
@@ -81,7 +83,7 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
     };
 
     widget.existingWebRTC.onScreenShareError = (error) {
-      debugPrint('❌ Screen share error: $error'); // Add this line
+      debugPrint('❌ Screen share error: $error');
       if (!mounted) return;
       setState(() => _screenSharing = false);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -93,7 +95,7 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
       );
     };
 
-    // ✅ Add media tracks to existing peer connection
+    // Add media tracks to existing peer connection
     try {
       await widget.existingWebRTC.addMediaForCall(
         audio: true,
@@ -117,15 +119,17 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
       }
     });
 
-    // ✅ Enable speaker on outgoing call
+    // Enable speaker on outgoing call
     await widget.existingWebRTC.setSpeakerOn(true);
 
-    // ✅ Only the CALLER sends the offer
+    // BUG 4 FIX: Use renegotiate() instead of createOffer() to avoid double-offer.
+    // The data channel is already established from the chat phase; we only need to
+    // renegotiate to add the new audio/video tracks.
     if (widget.isCaller) {
       try {
-        await widget.existingWebRTC.createOffer();
+        await widget.existingWebRTC.renegotiate();
       } catch (e) {
-        debugPrint('❌ Call createOffer failed: $e');
+        debugPrint('❌ Call renegotiate failed: $e');
       }
     }
   }
@@ -149,19 +153,24 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
     if (notifyPeer) {
       widget.existingSignaling.sendCallEnd();
     }
+
+    // BUG 10 FIX: Stop microphone/camera tracks so they don't keep running after call
+    await widget.existingWebRTC.stopCallMedia();
+
+    // BUG 16 FIX: Mark renderers as disposed before calling dispose()
+    _renderersDisposed = true;
     try {
       _localRenderer.srcObject = null;
       _remoteRenderer.srcObject = null;
       await _localRenderer.dispose();
       await _remoteRenderer.dispose();
     } catch (_) {}
+
     if (mounted) Navigator.pop(context);
   }
 
   Future<void> _toggleScreenShare() async {
-    // Prevent multiple taps
     if (_screenSharing) {
-      // Stop screen sharing
       try {
         await widget.existingWebRTC.stopScreenShare(video: widget.isVideo);
         if (mounted) {
@@ -177,9 +186,7 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
         }
       }
     } else {
-      // Start screen sharing
       try {
-        // Set state first
         if (mounted) {
           setState(() {
             _screenSharing = true;
@@ -187,10 +194,8 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
           });
         }
 
-        // Call the screen share method
         await widget.existingWebRTC.addScreenShare();
 
-        // If successful, update the renderer
         if (mounted && widget.existingWebRTC.localStream != null) {
           setState(() {
             _localRenderer.srcObject = widget.existingWebRTC.localStream;
@@ -199,7 +204,6 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
         }
       } catch (e) {
         debugPrint('❌ addScreenShare error: $e');
-        // Error is already handled by onScreenShareError callback
         if (mounted) {
           setState(() => _screenSharing = false);
         }
@@ -219,9 +223,14 @@ class _CallScreenState extends State<CallScreen> with WidgetsBindingObserver {
   void dispose() {
     _timer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    if (!_ended) {
-      _localRenderer.dispose();
-      _remoteRenderer.dispose();
+    // BUG 16 FIX: guard against double-dispose when _endCall() already disposed renderers
+    if (!_renderersDisposed) {
+      try {
+        _localRenderer.dispose();
+      } catch (_) {}
+      try {
+        _remoteRenderer.dispose();
+      } catch (_) {}
     }
     super.dispose();
   }
